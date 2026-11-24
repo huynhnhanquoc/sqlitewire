@@ -72,6 +72,9 @@ type Options struct {
 	// prepared after its Read, and kept prepared on each reader connection it runs on, so it holds up to Readers
 	// SQLite statements; past the bound the least recently used is closed.
 	Statements int
+	// QueryCache bounds the bytes of the results Query keeps (8 MiB); -1 keeps none. A result bigger than a sixteenth
+	// of it is not kept.
+	QueryCache int
 	// PageSize is the page size of a new file (16384).
 	PageSize int
 	// Search lists the tables Snapshot.Search can rank.
@@ -103,6 +106,13 @@ func (options Options) normalized() (Options, error) {
 	if options.SearchFold == 0 {
 		options.SearchFold = 1024
 	}
+	if options.QueryCache == 0 {
+		options.QueryCache = defaultQueryCache
+	} else if options.QueryCache == -1 {
+		options.QueryCache = 0
+	} else if options.QueryCache < 0 {
+		return Options{}, fmt.Errorf("kitdb: the query cache must be positive, or -1 for none")
+	}
 	if options.Statements == 0 {
 		options.Statements = defaultStatements
 	} else if options.Statements == -1 {
@@ -126,6 +136,7 @@ type Database struct {
 	writer      *writer
 	readers     *sql.DB
 	statements  *statements
+	queries     *queryCache
 	container   *search.Container
 	searchables map[string]*searchable
 	closed      atomic.Bool
@@ -213,6 +224,7 @@ func Open(ctx context.Context, path string, options Options) (*Database, error) 
 	database.readers.SetMaxOpenConns(options.Readers)
 	database.readers.SetMaxIdleConns(options.Readers)
 	database.statements = newStatements(options.Statements)
+	database.queries = newQueryCache(int64(options.QueryCache), database.writer.versions)
 	if err := database.cleanAnchorDirectory(); err != nil {
 		return nil, err
 	}
@@ -599,6 +611,9 @@ func (database *Database) release() error {
 	database.backgroundMutex.Lock()
 	errs = append(errs, database.backgroundErr)
 	database.backgroundMutex.Unlock()
+	if database.queries != nil {
+		database.queries.close()
+	}
 	if database.statements != nil {
 		errs = append(errs, database.statements.close())
 	}

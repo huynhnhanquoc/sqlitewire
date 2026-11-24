@@ -9,7 +9,9 @@ It is not a whole PostgreSQL: it speaks PostgreSQL's protocol, and rewrites the 
 
 - `sqlite`: one writer per file; a history written in the transaction of each commit, chained by checksum, for the
   tables that keep it; anchors (a base of the file's pages, then the pages changed) and restore to a point in time;
-  reading a table as it was at a past revision (`PastRelation`); backup.
+  reading a table as it was at a past revision (`PastRelation`); backup. Reads keep their statements prepared on each
+  connection, and `Database.Query` keeps a statement's result until a commit changes a table it reads (the doc of
+  `sqlite/querycache.go` says how it stays exact).
 - `gateway`: the sessions of the PostgreSQL port on the SQLite files: `pg_catalog` and `information_schema`, PostgreSQL
   statements rewritten for SQLite, grants checked on each statement, writes through the file's one writer, and the
   limits of a statement (rows, bytes, time, temporary files).

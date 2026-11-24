@@ -99,3 +99,41 @@ func BenchmarkReadParallel(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkQuery is the same statement through Query: kept, its result is given again; none, it reads every time.
+func BenchmarkQuery(b *testing.B) {
+	for _, mode := range []struct {
+		name  string
+		cache int
+	}{{"kept", 0}, {"none", -1}} {
+		b.Run(mode.name, func(b *testing.B) {
+			database := readFixture(b, 0)
+			if mode.cache == -1 {
+				database.queries.capacity = 0 // as Options.QueryCache -1
+			}
+			ctx := context.Background()
+			b.ReportAllocs()
+			for b.Loop() {
+				result, err := database.Query(ctx, readStatement, "moi")
+				if err != nil || len(result.Rows) != 5 {
+					b.Fatal(err, len(result.Rows))
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkQueryParallel is BenchmarkQuery's kept statement from as many goroutines as GOMAXPROCS.
+func BenchmarkQueryParallel(b *testing.B) {
+	database := readFixture(b, 0)
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if _, err := database.Query(ctx, readStatement, "moi"); err != nil {
+				b.Error(err)
+				return
+			}
+		}
+	})
+}

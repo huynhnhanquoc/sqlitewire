@@ -100,6 +100,15 @@ type writer struct {
 	// light are the tables tracked for their search or their columns copy alone, not their history (lower case): a
 	// change of one is recorded light, which row and how, no image (lightFormat, 09/11/2026).
 	light map[string]bool
+
+	// versions number the commits for the query cache (querycache.go). touched are the tables of the main database
+	// the hook saw a row of change since the last commit, followed or not; everything says the work since may have
+	// changed any table (a schema statement, a Maintain). dataVersion is PRAGMA data_version of the writer's connection,
+	// which moves only when another connection, another process's, commits to the file (noticeOthers).
+	versions    *tableVersions
+	touched     map[string]struct{}
+	everything  bool
+	dataVersion int64
 }
 
 func openWriter(ctx context.Context, name string, options Options, anchor func(context.Context) (uint64, error),
@@ -120,6 +129,7 @@ func openWriter(ctx context.Context, name string, options Options, anchor func(c
 		pool: pool, conn: conn, queue: make(chan writerRequest, options.Queue),
 		finished: make(chan struct{}), maximumBatch: options.MaximumBatch, anchor: anchor,
 		whole: map[string]map[string]bool{}, structure: options.Structure, every: options.HistoryOfEveryTable,
+		versions: newTableVersions(), touched: map[string]struct{}{},
 	}
 	for _, table := range options.Search {
 		if w.whole[table.Table] == nil {
@@ -160,6 +170,9 @@ func openWriter(ctx context.Context, name string, options Options, anchor func(c
 		return fail(err)
 	}
 	if err := w.follow(ctx); err != nil {
+		return fail(err)
+	}
+	if err := conn.QueryRowContext(ctx, "PRAGMA data_version").Scan(&w.dataVersion); err != nil {
 		return fail(err)
 	}
 	// from here; a start as the file opens is Open's, once the anchor directory is clean
@@ -244,6 +257,9 @@ func (w *writer) resync(ctx context.Context) error {
 }
 
 func (w *writer) hook(data modernc.SQLitePreUpdateData) {
+	if data.DatabaseName == "main" {
+		w.touched[data.TableName] = struct{}{} // the query cache's, before any table is left out of the history
+	}
 	if data.DatabaseName != "main" || data.TableName == historyTable || w.hookErr != nil || !w.records(data.TableName) {
 		return
 	}
@@ -316,16 +332,23 @@ func (w *writer) run() {
 	defer close(w.finished)
 	w.goroutine.Store(goroutineID())
 	var pending *writerRequest
+	others := time.NewTicker(othersInterval)
+	defer others.Stop()
 	for {
 		var first writerRequest
 		if pending != nil {
 			first, pending = *pending, nil
 		} else {
-			request, open := <-w.queue
-			if !open {
-				return
+			select {
+			case request, open := <-w.queue:
+				if !open {
+					return
+				}
+				first = request
+			case <-others.C:
+				w.noticeOthers()
+				continue
 			}
-			first = request
 		}
 		switch {
 		case w.refused != nil:
@@ -458,6 +481,7 @@ func (w *writer) commitSchema(request writerRequest) {
 		return
 	}
 	w.events, w.broken, w.by, w.hookErr = w.events[:0], nil, request.by, nil
+	w.everything = true // a statement of the schema may change what any statement reads
 	previous := w.shapes
 	err := request.ctx.Err()
 	if err == nil {
@@ -530,7 +554,12 @@ func (w *writer) commitMaintain(request writerRequest) {
 		return
 	}
 	w.events, w.broken, w.by, w.hookErr = w.events[:0], nil, request.by, nil
+	w.versions.changing(nil, true) // the work commits as it goes, each COMMIT seen by snapshots at once
 	workErr := w.runMaintain(request)
+	// the work committed as it went, on the writer's connection, outside finish: whatever it changed, the query cache
+	// forgets every result before the request is answered
+	w.everything = true
+	w.publish()
 	rows := ""
 	for _, change := range w.events {
 		if !bookkeeping(change.table) {
@@ -638,10 +667,12 @@ func (w *writer) finish(changes []Change, err error) (uint64, error) {
 		}
 	}
 	if err == nil {
+		w.versions.changing(w.touched, w.everything)
 		err = w.exec("COMMIT")
 	}
 	if err != nil {
 		_ = w.exec("ROLLBACK")
+		w.publish() // a table marked changing gets a number back; nothing changed, so it costs only the results dropped
 		if syncErr := w.resync(context.Background()); syncErr != nil {
 			err = errors.Join(err, syncErr)
 		}
@@ -651,7 +682,49 @@ func (w *writer) finish(changes []Change, err error) (uint64, error) {
 		w.revision, w.at, w.checksum = revision, at, checksum
 		w.committed.Store(revision)
 	}
+	if committedHook != nil {
+		committedHook()
+	}
+	w.publish()
 	return w.revision, nil
+}
+
+// committedHook, set by tests only, runs on the writer goroutine after a COMMIT and before it is published.
+var committedHook func()
+
+// publish numbers the commit just made for the query cache: the tables it changed, every table after a schema
+// statement or a Maintain. It runs after the COMMIT returned and before any request of the commit is answered, so a
+// Query that starts once a Write returned never gets a result read before it. The tables were marked changing before
+// the COMMIT (tableVersions.changing): between the two, a snapshot may already show the commit, so no result of them
+// is given or kept.
+func (w *writer) publish() {
+	w.versions.committed(w.touched, w.everything)
+	w.forget()
+}
+
+// forget drops what the hook saw since the last commit, after a ROLLBACK or once published.
+func (w *writer) forget() {
+	clear(w.touched)
+	w.everything = false
+}
+
+// othersInterval is how often the waiting writer looks for a commit another connection made to the file.
+var othersInterval = time.Second
+
+// noticeOthers reads PRAGMA data_version on the writer's connection. It moves only when another connection commits,
+// the readers never do, so a change is a write from another process or tool, which the history does not see either:
+// the query cache forgets every result. The change is noticed within othersInterval while the writer waits, not at
+// once: such a write is outside what Database promises.
+func (w *writer) noticeOthers() {
+	var version int64
+	if err := w.conn.QueryRowContext(context.Background(), "PRAGMA data_version").Scan(&version); err != nil {
+		return
+	}
+	if version != w.dataVersion {
+		w.dataVersion = version
+		w.everything = true
+		w.publish()
+	}
 }
 
 func (w *writer) runRequest(request writerRequest) (err error) {
@@ -1076,9 +1149,11 @@ func (w *writer) adopt(ctx context.Context) error {
 		}
 	}
 	if err == nil {
+		w.versions.changing(w.touched, false)
 		err = w.exec("COMMIT")
 	}
 	w.events = w.events[:0] // the file's own settings, not changes to replay
+	w.publish()
 	if err != nil {
 		_ = w.exec("ROLLBACK")
 		return err

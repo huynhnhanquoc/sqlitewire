@@ -68,6 +68,10 @@ type Options struct {
 	Queue int
 	// Readers bounds concurrent read connections (8).
 	Readers int
+	// Statements bounds the read statements kept prepared (128); -1 keeps none. A statement Snapshot.Query ran is
+	// prepared after its Read, and kept prepared on each reader connection it runs on, so it holds up to Readers
+	// SQLite statements; past the bound the least recently used is closed.
+	Statements int
 	// PageSize is the page size of a new file (16384).
 	PageSize int
 	// Search lists the tables Snapshot.Search can rank.
@@ -99,6 +103,13 @@ func (options Options) normalized() (Options, error) {
 	if options.SearchFold == 0 {
 		options.SearchFold = 1024
 	}
+	if options.Statements == 0 {
+		options.Statements = defaultStatements
+	} else if options.Statements == -1 {
+		options.Statements = 0
+	} else if options.Statements < 0 {
+		return Options{}, fmt.Errorf("kitdb: statements must be positive, or -1 for none")
+	}
 	if options.MaximumBatch < 1 || options.Queue < 1 || options.Readers < 1 || options.SearchFold < 1 {
 		return Options{}, fmt.Errorf("kitdb: options must be positive")
 	}
@@ -114,6 +125,7 @@ type Database struct {
 	lock        *fileLock
 	writer      *writer
 	readers     *sql.DB
+	statements  *statements
 	container   *search.Container
 	searchables map[string]*searchable
 	closed      atomic.Bool
@@ -200,6 +212,7 @@ func Open(ctx context.Context, path string, options Options) (*Database, error) 
 	}
 	database.readers.SetMaxOpenConns(options.Readers)
 	database.readers.SetMaxIdleConns(options.Readers)
+	database.statements = newStatements(options.Statements)
 	if err := database.cleanAnchorDirectory(); err != nil {
 		return nil, err
 	}
@@ -468,19 +481,31 @@ type Snapshot struct {
 	ctx      context.Context
 	tx       *sql.Tx
 	database *Database
+
+	// prepared are the kept statements the snapshot ran prepared (in ran, most snapshots run few), unprepared the
+	// texts it ran that Read prepares once the snapshot ends (prepared.go).
+	prepared   []string
+	ran        [4]string
+	unprepared []string
 }
 
 // Query runs one read statement inside the snapshot.
 func (snapshot *Snapshot) Query(query string, arguments ...any) (*sql.Rows, error) {
-	shape, err := classifyStatement(query)
-	if err != nil {
-		return nil, err
+	prepared := snapshot.database.statements.get(query)
+	if prepared == nil { // a kept statement was classified a read as it ran first
+		shape, err := classifyStatement(query)
+		if err != nil {
+			return nil, err
+		}
+		if shape.kind != statementRead {
+			return nil, fmt.Errorf("%w: a snapshot only reads", ErrStatementRefused)
+		}
 	}
-	if shape.kind != statementRead {
-		return nil, fmt.Errorf("%w: a snapshot only reads", ErrStatementRefused)
-	}
-	return snapshot.tx.QueryContext(snapshot.ctx, query, arguments...)
+	return snapshot.query(prepared, query, arguments...)
 }
+
+// revisionQuery is the last commit a snapshot sees.
+const revisionQuery = `SELECT coalesce(max(rev), 0) FROM kitwork_history`
 
 // Read runs read inside one snapshot on a reader connection.
 func (database *Database) Read(ctx context.Context, read func(*Snapshot) error) error {
@@ -491,14 +516,38 @@ func (database *Database) Read(ctx context.Context, read func(*Snapshot) error) 
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
-	var revision int64
-	if err := tx.QueryRowContext(ctx, `SELECT coalesce(max(rev), 0) FROM kitwork_history`).Scan(&revision); err != nil {
+	snapshot := &Snapshot{ctx: ctx, tx: tx, database: database}
+	snapshot.prepared = snapshot.ran[:0]
+	err = snapshot.run(read)
+	// the connection is back in the pool: preparing here waits for no Read
+	database.prepare(ctx, snapshot.unprepared)
+	return err
+}
+
+// run reads the snapshot's revision, then runs read; the transaction ends with it, even when read panics.
+func (snapshot *Snapshot) run(read func(*Snapshot) error) error {
+	defer snapshot.tx.Rollback()
+	rows, err := snapshot.query(snapshot.database.statements.get(revisionQuery), revisionQuery)
+	if err != nil {
 		return err
 	}
-	database.trackSnapshot(uint64(revision), 1)
-	defer database.trackSnapshot(uint64(revision), -1)
-	return read(&Snapshot{Revision: uint64(revision), ctx: ctx, tx: tx, database: database})
+	if !rows.Next() {
+		_ = rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		return sql.ErrNoRows
+	}
+	err = rows.Scan(&snapshot.Revision)
+	if closeErr := rows.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	snapshot.database.trackSnapshot(snapshot.Revision, 1)
+	defer snapshot.database.trackSnapshot(snapshot.Revision, -1)
+	return read(snapshot)
 }
 
 func (database *Database) trackSnapshot(revision uint64, delta int) {
@@ -550,6 +599,9 @@ func (database *Database) release() error {
 	database.backgroundMutex.Lock()
 	errs = append(errs, database.backgroundErr)
 	database.backgroundMutex.Unlock()
+	if database.statements != nil {
+		errs = append(errs, database.statements.close())
+	}
 	if database.readers != nil {
 		errs = append(errs, database.readers.Close())
 	}
